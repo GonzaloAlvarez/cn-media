@@ -64,6 +64,32 @@ if [ -f "$NETXML" ]; then
   fi
 fi
 
+# ── 4b. neutralize legacy migrations.xml ──────────────────────────────────
+# Pre-10.10 jellyfin tracked applied migrations in migrations.xml; 10.10+
+# moved that into __EFMigrationsHistory in the SQLite DB. If the legacy
+# file is present, 10.11's migration converter tries to map old GUIDs to
+# new IDs, filters to known mappings, and crashes with
+# "Sequence contains no elements" when none of them map (the legacy file
+# only has 3-4 entries with GUIDs that have no direct 10.11 equivalent).
+#
+# Replace with an empty Applied list so the converter sees "nothing
+# legacy to convert" and falls through to the normal startup path. The
+# DB already has all 68 EF migrations applied (legacy was migrated
+# forward to 10.11.x schema before the upgrade attempt that broke).
+MIGXML="$REPO_DIR/jellyfin/migrations.xml"
+if [ -f "$MIGXML" ] && grep -q '<ValueTupleOfGuidString>' "$MIGXML"; then
+  echo "[4b/7] neutralizing legacy migrations.xml (preserves a backup)"
+  cp -n "$MIGXML" "$MIGXML.legacy-backup" 2>/dev/null || true
+  cat > "$MIGXML" <<'XML'
+<?xml version="1.0" encoding="utf-8"?>
+<MigrationOptions xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <Applied />
+</MigrationOptions>
+XML
+else
+  echo "[4b/7] migrations.xml already neutralized (or absent)"
+fi
+
 # ── 5. systemd unit ──────────────────────────────────────────────────────
 UNIT_SRC="$REPO_DIR/systemd/docker-compose@cn-media.service"
 UNIT_DST="/etc/systemd/system/docker-compose@cn-media.service"
