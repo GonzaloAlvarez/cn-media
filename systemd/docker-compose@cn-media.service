@@ -1,0 +1,20 @@
+[Unit]
+Description=cn-media docker compose stack (jellyfin + future media services)
+Requires=docker.service home-gonzalo-docker-data-nfs.mount
+After=docker.service home-gonzalo-docker-data-nfs.mount network-online.target
+RequiresMountsFor=/home/gonzalo/docker/data/nfs
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=gonzalo
+Group=gonzalo
+WorkingDirectory=/home/gonzalo/cn-media
+Environment="PWD=/home/gonzalo/cn-media"
+ExecStartPre=/usr/bin/mountpoint -q /home/gonzalo/docker/data/nfs
+ExecStart=/usr/bin/docker compose -p cn-media up -d --remove-orphans
+ExecStop=/usr/bin/docker compose -p cn-media down
+
+[Install]
+WantedBy=multi-user.target

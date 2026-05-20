@@ -1,0 +1,197 @@
+services:
+  # ── NFS preflight: bail early if /home/gonzalo/docker/data/nfs isn't up ──
+  mount-precheck:
+    image: alpine:3.20
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        mountpoint -q /nfs-check || { echo "FAIL: NFS not mounted at /home/gonzalo/docker/data/nfs"; exit 1; }
+        test -d /nfs-check/media   || echo "WARN: /media subtree missing on NFS (jellyfin will start with empty libraries)"
+        echo "NFS OK ($$(df -h /nfs-check | tail -1 | awk '{print $$4}') free)"
+    volumes:
+      - /home/gonzalo/docker/data/nfs:/nfs-check:ro
+    restart: "no"
+
+  # ── Tailscale sidecar: owns the netns shared by jellyfin + observability ──
+  ts-jellyfin:
+    image: tailscale/tailscale:latest
+    hostname: ts-jellyfin
+    cap_add: [NET_ADMIN, SYS_MODULE]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+    volumes:
+      - ts_state:/var/lib/tailscale
+      - ./certs/root_ca.crt:/staging-certs/root_ca.crt:ro
+      - /lib/modules:/lib/modules:ro
+    environment:
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_AUTHKEY=${MEDIA_AUTHKEY}
+      - TS_HOSTNAME=jellyfin
+      - TS_ACCEPT_DNS=true
+      - TS_AUTH_ONCE=true
+      - TS_USERSPACE=false
+      - TS_TAILSCALED_EXTRA_ARGS=--tun=tailscale0
+      - TS_EXTRA_ARGS=--login-server=https://${HEADSCALE_DOMAIN}
+      - SSL_CERT_DIR=/staging-certs
+    ports:
+      - "127.0.0.1:8096:8096"
+    depends_on:
+      mount-precheck:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "tailscale ip --4 >/dev/null 2>&1"]
+      interval: 10s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── Jellyfin: media server, shares ts-jellyfin's netns ──
+  jellyfin:
+    image: lscr.io/linuxserver/jellyfin:10.10.7
+    network_mode: "service:ts-jellyfin"
+    environment:
+      - PUID=${USER_ID}
+      - PGID=${GROUP_ID}
+      - TZ=${TIMEZONE}
+    volumes:
+      - ./jellyfin:/config
+      - /home/gonzalo/docker/data/nfs:/data:ro
+    devices:
+      - /dev/dri/renderD128:/dev/dri/renderD128
+      - /dev/dri/card0:/dev/dri/card0
+    group_add:
+      - "44"
+      - "106"
+    depends_on:
+      ts-jellyfin:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Consul self-registration: makes jellyfin.lab.gn.al routable via traefik-lab ──
+  consul-register:
+    image: curlimages/curl:8.8.0
+    network_mode: "service:ts-jellyfin"
+    environment:
+      - CONSUL_ADDR=http://${INFRA_VPS_TAILNET_IP}:8500
+      - TAILNET_HOST=jellyfin.${TAILNET_DOMAIN}
+      - LAB_DOMAIN=${LAB_DOMAIN}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        register() {
+          NAME=$$1; PORT=$$2; SUB=$$3
+          PAYLOAD=$$(cat <<JSON
+        {
+          "Name": "$$NAME",
+          "ID": "$$NAME-media",
+          "Address": "$$TAILNET_HOST",
+          "Port": $$PORT,
+          "Tags": [
+            "traefik.enable=true",
+            "traefik.http.routers.$$NAME.rule=Host(\`$$SUB.$$LAB_DOMAIN\`)",
+            "traefik.http.routers.$$NAME.entrypoints=websecure",
+            "traefik.http.routers.$$NAME.tls=true",
+            "traefik.http.routers.$$NAME.tls.certresolver=dns"
+          ],
+          "Check": {
+            "TCP": "$$TAILNET_HOST:$$PORT",
+            "Interval": "10s",
+            "DeregisterCriticalServiceAfter": "2m"
+          }
+        }
+        JSON
+          )
+          curl -sf -X PUT "$$CONSUL_ADDR/v1/agent/service/register" \
+               -H "Content-Type: application/json" -d "$$PAYLOAD" >/dev/null \
+            && echo "registered $$NAME ($$SUB.$$LAB_DOMAIN -> :$$PORT)" \
+            || echo "FAILED to register $$NAME" >&2
+        }
+        while true; do
+          register jellyfin 8096 jellyfin
+          sleep 60
+        done
+    depends_on:
+      ts-jellyfin:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── promtail: ship container logs to VPS Loki ──
+  promtail:
+    image: grafana/promtail:3.4.2
+    network_mode: "service:ts-jellyfin"
+    command: ["-config.file=/etc/promtail/promtail.yml", "-config.expand-env=true"]
+    volumes:
+      - ./promtail/promtail.yml:/etc/promtail/promtail.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      - INFRA_VPS_TAILNET_IP=${INFRA_VPS_TAILNET_IP}
+    depends_on:
+      ts-jellyfin:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── node-exporter: stack-level metrics into VPS Prometheus ──
+  node-exporter:
+    image: prom/node-exporter:latest
+    network_mode: "service:ts-jellyfin"
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.sysfs=/host/sys"
+      - "--path.rootfs=/rootfs"
+      - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    depends_on:
+      ts-jellyfin:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── ts-jellyfin watchdog: force-recreate dependents on netns drift ──
+  ts-jellyfin-watchdog:
+    image: docker:cli
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${PWD}:${PWD}
+    working_dir: ${PWD}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        apk add --no-cache docker-cli-compose >/dev/null
+        echo "[watchdog] ready, polling ts-jellyfin every 10s"
+        LAST=""
+        while true; do
+          CUR=$$(docker inspect cn-media-ts-jellyfin-1 --format "{{.State.StartedAt}}" 2>/dev/null || true)
+          if [ -n "$$CUR" ] && [ -n "$$LAST" ] && [ "$$CUR" != "$$LAST" ]; then
+            echo "[watchdog] ts-jellyfin restarted (was $$LAST, now $$CUR), recreating dependents"
+            docker compose -p cn-media up -d --force-recreate --no-deps \
+              jellyfin consul-register promtail node-exporter \
+              && echo "[watchdog] OK" \
+              || echo "[watchdog] FAILED"
+          fi
+          LAST="$$CUR"
+          sleep 10
+        done
+    restart: unless-stopped
+
+  watchtower:
+    image: containrrr/watchtower:latest
+    command:
+      - "--cleanup"
+      - "--schedule=0 0 4 * * *"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - DOCKER_API_VERSION=1.45
+    restart: unless-stopped
+
+volumes:
+  ts_state:
