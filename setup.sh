@@ -90,6 +90,22 @@ else
   echo "[4b/7] migrations.xml already neutralized (or absent)"
 fi
 
+# ── 4c. enable jellyfin built-in Prometheus /metrics endpoint ──────────
+# Jellyfin's <EnableMetrics> in system.xml gates the /metrics route.
+# Default is false. When true, /metrics is served unauth on the main
+# port (8096). VPS Prometheus scrapes jellyfin.ts.gn.al:8096/metrics.
+SYSXML="$REPO_DIR/jellyfin/system.xml"
+if [ -f "$SYSXML" ]; then
+  if grep -q '<EnableMetrics>false</EnableMetrics>' "$SYSXML"; then
+    sudo sed -i 's|<EnableMetrics>false</EnableMetrics>|<EnableMetrics>true</EnableMetrics>|' "$SYSXML"
+    echo "[4c/7] EnableMetrics flipped to true in system.xml"
+  elif grep -q '<EnableMetrics>true</EnableMetrics>' "$SYSXML"; then
+    echo "[4c/7] EnableMetrics already true"
+  else
+    echo "[4c/7] WARN: <EnableMetrics> tag missing from system.xml — jellyfin will recreate on next start"
+  fi
+fi
+
 # ── 5. systemd unit ──────────────────────────────────────────────────────
 UNIT_SRC="$REPO_DIR/systemd/docker-compose@cn-media.service"
 UNIT_DST="/etc/systemd/system/docker-compose@cn-media.service"
