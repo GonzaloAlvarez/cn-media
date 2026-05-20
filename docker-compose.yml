@@ -51,7 +51,7 @@ services:
 
   # ── Jellyfin: media server, shares ts-jellyfin's netns ──
   jellyfin:
-    image: lscr.io/linuxserver/jellyfin:10.9.11
+    image: lscr.io/linuxserver/jellyfin:10.11.8
     network_mode: "service:ts-jellyfin"
     environment:
       - PUID=${USER_ID}
