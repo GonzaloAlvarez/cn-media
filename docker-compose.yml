@@ -155,6 +155,12 @@ services:
     restart: unless-stopped
 
   # ── ts-jellyfin watchdog: force-recreate dependents on netns drift ──
+  # Detects drift by comparing each dependent's HostConfig.NetworkMode
+  # ("container:<id>") against ts-jellyfin's current container ID. Self-heals
+  # on its own first poll (so a coordinated stack restart, e.g. watchtower,
+  # cannot leave dependents pinned to an orphaned netns inode), silently
+  # no-ops in steady state. Also restarts dependents stuck in non-running
+  # status (e.g. Created-but-never-started after a midway compose failure).
   ts-jellyfin-watchdog:
     image: docker:cli
     volumes:
@@ -166,18 +172,36 @@ services:
       - -c
       - |
         apk add --no-cache docker-cli-compose >/dev/null
-        echo "[watchdog] ready, polling ts-jellyfin every 10s"
-        LAST=""
+        DEPS="jellyfin consul-register promtail node-exporter"
+        echo "[watchdog] ready, polling dependents every 10s ($$DEPS)"
         while true; do
-          CUR=$$(docker inspect cn-media-ts-jellyfin-1 --format "{{.State.StartedAt}}" 2>/dev/null || true)
-          if [ -n "$$CUR" ] && [ -n "$$LAST" ] && [ "$$CUR" != "$$LAST" ]; then
-            echo "[watchdog] ts-jellyfin restarted (was $$LAST, now $$CUR), recreating dependents"
-            docker compose -p cn-media up -d --force-recreate --no-deps \
-              jellyfin consul-register promtail node-exporter \
-              && echo "[watchdog] OK" \
-              || echo "[watchdog] FAILED"
+          TS_ID=$$(docker inspect cn-media-ts-jellyfin-1 --format "{{.Id}}" 2>/dev/null || true)
+          if [ -n "$$TS_ID" ]; then
+            NEED_RECREATE=""
+            NEED_START=""
+            for dep in $$DEPS; do
+              INFO=$$(docker inspect cn-media-$$dep-1 --format "{{.HostConfig.NetworkMode}} {{.State.Status}}" 2>/dev/null || true)
+              [ -n "$$INFO" ] || continue
+              DEP_NM=$$(echo "$$INFO" | awk "{print \$$1}")
+              DEP_STATUS=$$(echo "$$INFO" | awk "{print \$$2}")
+              DEP_TARGET=$${DEP_NM#container:}
+              if [ "$$DEP_TARGET" != "$$TS_ID" ]; then
+                NEED_RECREATE="$$NEED_RECREATE $$dep"
+              elif [ "$$DEP_STATUS" != "running" ]; then
+                NEED_START="$$NEED_START $$dep"
+              fi
+            done
+            if [ -n "$$NEED_RECREATE" ]; then
+              echo "[watchdog] netns drift on:$$NEED_RECREATE -- recreating"
+              docker compose -p cn-media up -d --force-recreate --no-deps $$NEED_RECREATE \
+                && echo "[watchdog] recreate OK" || echo "[watchdog] recreate FAILED"
+            fi
+            if [ -n "$$NEED_START" ]; then
+              echo "[watchdog] stopped on:$$NEED_START -- starting"
+              docker compose -p cn-media start $$NEED_START \
+                && echo "[watchdog] start OK" || echo "[watchdog] start FAILED"
+            fi
           fi
-          LAST="$$CUR"
           sleep 10
         done
     restart: unless-stopped
