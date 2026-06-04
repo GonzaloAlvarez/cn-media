@@ -1,7 +1,14 @@
 [Unit]
 Description=cn-media docker compose stack (jellyfin + future media services)
 Requires=docker.service home-gonzalo-docker-data-nfs.mount
-After=docker.service home-gonzalo-docker-data-nfs.mount network-online.target
+# Serial start ordering with sibling stacks on this host: cn-bittorrent ->
+# cn-media -> cn-roms. Three docker-compose@ units all touch the docker
+# socket and the in-stack watchdog runs `docker compose up` concurrently;
+# parallel-firing after boot races the watchdog/compose pairs into name
+# conflicts. Sequential After= ordering eliminates the parallel trigger
+# (it's ordering only, not a dependency — cn-media still starts if
+# cn-bittorrent fails).
+After=docker.service home-gonzalo-docker-data-nfs.mount network-online.target docker-compose@cn-bittorrent.service
 RequiresMountsFor=/home/gonzalo/docker/data/nfs
 Wants=network-online.target
 
