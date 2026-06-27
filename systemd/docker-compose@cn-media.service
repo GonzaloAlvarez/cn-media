@@ -10,6 +10,12 @@ Requires=docker.service home-gonzalo-docker-data-nfs.mount
 # cn-bittorrent fails).
 After=docker.service home-gonzalo-docker-data-nfs.mount network-online.target docker-compose@cn-bittorrent.service
 RequiresMountsFor=/home/gonzalo/docker/data/nfs
+# BindsTo: if the NFS mount unit FAILS (e.g. mount timeout, as on 2026-06-22),
+# tear the stack down instead of leaving jellyfin bound to the empty local
+# placeholder — which makes every playback fail with a fatal player error.
+# `hard,_netdev` means a transient server blip doesn't change the .mount state
+# (I/O just blocks), so this won't flap on momentary outages.
+BindsTo=home-gonzalo-docker-data-nfs.mount
 Wants=network-online.target
 
 [Service]
@@ -20,6 +26,8 @@ Group=gonzalo
 WorkingDirectory=/home/gonzalo/cn-media
 Environment="PWD=/home/gonzalo/cn-media"
 ExecStartPre=/usr/bin/mountpoint -q /home/gonzalo/docker/data/nfs
+# Assert it's REALLY nfs, not the empty local placeholder a failed mount leaves.
+ExecStartPre=/bin/sh -c '[ "$(stat -f -c %%T /home/gonzalo/docker/data/nfs)" = nfs ]'
 ExecStart=/usr/bin/docker compose -p cn-media up -d --remove-orphans
 ExecStop=/usr/bin/docker compose -p cn-media down
 
