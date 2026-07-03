@@ -3,6 +3,7 @@
 boot:
   enabled: true
   nfs_mount: /home/gonzalo/docker/data/nfs
+  binds_to_mount: true
   after: [cn-bittorrent]
 reconcile:
   enabled: true
